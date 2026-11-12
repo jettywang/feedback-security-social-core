@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Fix OAuth1 callback failing with `TypeError: unhashable type: 'dict'` when the
+  session holds pending request tokens saved by both the legacy (dict) and
+  current (encoded string) formats, so concurrent authorization attempts can
+  complete in any order again.
+
 ## [7.1.0](https://github.com/python-social-auth/social-core/releases/tag/7.1.0) - 2026-11-11
 
 ### Security

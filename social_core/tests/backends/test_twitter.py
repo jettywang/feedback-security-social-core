@@ -1,10 +1,16 @@
 import json
 from urllib.parse import urlencode
 
-from .oauth import OAuth1AuthUrlTestMixin, OAuth1Test
+from .oauth import (
+    OAuth1AuthUrlTestMixin,
+    OAuth1ConcurrentTokensTestMixin,
+    OAuth1Test,
+)
 
 
-class TwitterOAuth1Test(OAuth1Test, OAuth1AuthUrlTestMixin):
+class TwitterOAuth1Test(
+    OAuth1Test, OAuth1AuthUrlTestMixin, OAuth1ConcurrentTokensTestMixin
+):
     backend_path = "social_core.backends.twitter.TwitterOAuth"
     user_data_url = "https://api.twitter.com/1.1/account/verify_credentials.json"
     expected_username = "foobar"

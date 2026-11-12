@@ -373,6 +373,29 @@ class AuthenticationFailureBoundaryTest(unittest.TestCase):
             self.assertEqual(caught.exception.recovery, "restart_login")
             self.assertEqual(caught.exception.stage, "callback")
 
+    def test_oauth1_mixed_legacy_and_current_session_tokens(self):
+        backend = BaseOAuth1(self.strategy)
+        name = backend.name + backend.UNATHORIZED_TOKEN_SUFIX
+        legacy_token = {
+            "oauth_token": "legacy-token",
+            "oauth_token_secret": "legacy-secret",
+        }
+        current_token = "oauth_token=current-token&oauth_token_secret=current-secret"
+        self.strategy.session_set(name, [legacy_token, current_token])
+
+        backend.data = {"oauth_token": "current-token"}
+        token = backend.get_unauthorized_token()
+        self.assertEqual(
+            token,
+            {"oauth_token": "current-token", "oauth_token_secret": "current-secret"},
+        )
+        self.assertEqual(self.strategy.session_get(name), [legacy_token])
+
+        backend.data = {"oauth_token": "legacy-token"}
+        token = backend.get_unauthorized_token()
+        self.assertEqual(token, legacy_token)
+        self.assertEqual(self.strategy.session_get(name), [])
+
     def test_azure_assertion_configuration_failures_preserve_operation_stage(
         self,
     ) -> None:

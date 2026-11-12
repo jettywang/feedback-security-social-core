@@ -285,14 +285,13 @@ class BaseOAuth1(OAuthAuth[ResponseT_co]):
             )
 
         token = None
-        for utoken in unauthed_tokens:
-            orig_utoken = utoken
+        for index, utoken in enumerate(unauthed_tokens):
             if not isinstance(utoken, dict):
                 utoken = parse_qs(utoken)
             if utoken.get(self.OAUTH_TOKEN_PARAMETER_NAME) == data_token:
-                self.strategy.session_set(
-                    name, list(set(unauthed_tokens) - {orig_utoken})
-                )
+                remaining_tokens = list(unauthed_tokens)
+                remaining_tokens.pop(index)
+                self.strategy.session_set(name, remaining_tokens)
                 token = utoken
                 break
         else:

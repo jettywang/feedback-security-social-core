@@ -3,13 +3,15 @@ from __future__ import annotations
 import time
 from typing import Generic, TypeVar, cast
 from unittest.mock import patch
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 import requests
 import responses
+from requests_oauthlib import OAuth1
 
 from social_core.backends.oauth import BaseOAuth1, BaseOAuth2, OAuthAuth
 from social_core.exceptions import (
+    AuthCanceled,
     AuthConfigurationError,
     AuthInputError,
     AuthSessionError,
@@ -432,3 +434,169 @@ class OAuth1AuthUrlTestMixin(BaseAuthUrlTestMixin):
     def test_auth_url_parameters(self) -> None:
         self.request_token_handler()
         self.check_parameters_in_authorization_url()
+
+
+class OAuth1ConcurrentTokensTestMixin(Generic[BaseOAuth1BackendT]):
+    """Concurrent OAuth1 authorization attempts sharing one session.
+
+    Sessions upgraded from older versions may mix legacy dict entries with
+    current encoded strings; each callback must consume only its own pending
+    token and leave the others untouched.
+    """
+
+    backend: BaseOAuth1BackendT
+
+    def queue_request_token(self, token: str, secret: str) -> None:
+        case = cast("OAuth1Test", self)
+        responses.add(
+            case._method(case.backend.REQUEST_TOKEN_METHOD),
+            case.backend.REQUEST_TOKEN_URL,
+            body=urlencode(
+                {
+                    "oauth_token": token,
+                    "oauth_token_secret": secret,
+                    "oauth_callback_confirmed": "true",
+                }
+            ),
+            status=200,
+        )
+
+    def start_flow(self, token: str, secret: str) -> None:
+        case = cast("OAuth1Test", self)
+        self.queue_request_token(token, secret)
+        case.backend.start()
+
+    def pending_tokens(self) -> list:
+        case = cast("OAuth1Test", self)
+        name = case.backend.name + case.backend.UNATHORIZED_TOKEN_SUFIX
+        return cast("list", case.strategy.session_get(name, []))
+
+    def use_legacy_format_for_first_token(self) -> dict:
+        case = cast("OAuth1Test", self)
+        name = case.backend.name + case.backend.UNATHORIZED_TOKEN_SUFIX
+        tokens = self.pending_tokens()
+        tokens[0] = parse_qs(tokens[0])
+        case.strategy.session_set(name, tokens)
+        return tokens[0]
+
+    def callback_state_data(self) -> dict:
+        case = cast("OAuth1Test", self)
+        state = case.strategy.session_get(f"{case.backend.name}_state")
+        if state and case.backend.STATE_PARAMETER:
+            return {"state": state}
+        if state and case.backend.REDIRECT_STATE:
+            return {"redirect_state": state}
+        return {}
+
+    def complete_flow(self, token: str, verifier: str):
+        case = cast("OAuth1Test", self)
+        case.pre_complete_callback("")
+        if case.user_data_url:
+            responses.add(
+                responses.POST if case.user_data_url_post else responses.GET,
+                case.user_data_url,
+                body=case.user_data_body or "",
+                content_type=case.user_data_content_type,
+            )
+        case.strategy.set_request_data(
+            {
+                "oauth_token": token,
+                "oauth_verifier": verifier,
+                **self.callback_state_data(),
+            },
+            case.backend,
+        )
+        with patch("social_core.backends.oauth.OAuth1", wraps=OAuth1) as oauth1:
+            user = case.backend.complete()
+        exchange_call = next(
+            call for call in oauth1.call_args_list if call.kwargs.get("verifier")
+        )
+        return user, exchange_call
+
+    def test_concurrent_flows_complete_in_reverse_order(self) -> None:
+        case = cast("OAuth1Test", self)
+        self.start_flow("first-token", "first-secret")
+        self.start_flow("second-token", "second-secret")
+        legacy_token = self.use_legacy_format_for_first_token()
+
+        user, exchange_call = self.complete_flow("second-token", "verifier-two")
+        case.assertEqual(user.username, case.expected_username)
+        case.assertEqual(exchange_call.kwargs["resource_owner_key"], "second-token")
+        case.assertEqual(
+            exchange_call.kwargs["resource_owner_secret"], "second-secret"
+        )
+        case.assertEqual(exchange_call.kwargs["verifier"], "verifier-two")
+        case.assertEqual(self.pending_tokens(), [legacy_token])
+
+        user, exchange_call = self.complete_flow("first-token", "verifier-one")
+        case.assertEqual(user.username, case.expected_username)
+        case.assertEqual(exchange_call.kwargs["resource_owner_key"], "first-token")
+        case.assertEqual(exchange_call.kwargs["resource_owner_secret"], "first-secret")
+        case.assertEqual(exchange_call.kwargs["verifier"], "verifier-one")
+        case.assertEqual(self.pending_tokens(), [])
+
+    def test_unknown_callback_token_preserves_pending_tokens(self) -> None:
+        case = cast("OAuth1Test", self)
+        self.start_flow("first-token", "first-secret")
+        self.start_flow("second-token", "second-secret")
+        legacy_token = self.use_legacy_format_for_first_token()
+        pending = list(self.pending_tokens())
+
+        case.strategy.set_request_data(
+            {
+                "oauth_token": "unknown-token",
+                "oauth_verifier": "verifier",
+                **self.callback_state_data(),
+            },
+            case.backend,
+        )
+        with case.assertRaises(AuthSessionError):
+            case.backend.complete()
+        case.assertEqual(self.pending_tokens(), pending)
+
+        user, _ = self.complete_flow("second-token", "verifier-two")
+        case.assertEqual(user.username, case.expected_username)
+        case.assertEqual(self.pending_tokens(), [legacy_token])
+
+    def test_consumed_callback_token_preserves_pending_tokens(self) -> None:
+        case = cast("OAuth1Test", self)
+        self.start_flow("first-token", "first-secret")
+        self.start_flow("second-token", "second-secret")
+        legacy_token = self.use_legacy_format_for_first_token()
+
+        self.complete_flow("second-token", "verifier-two")
+        case.assertEqual(self.pending_tokens(), [legacy_token])
+
+        case.strategy.set_request_data(
+            {
+                "oauth_token": "second-token",
+                "oauth_verifier": "verifier-two",
+                **self.callback_state_data(),
+            },
+            case.backend,
+        )
+        with case.assertRaises(AuthSessionError):
+            case.backend.complete()
+        case.assertEqual(self.pending_tokens(), [legacy_token])
+
+        user, exchange_call = self.complete_flow("first-token", "verifier-one")
+        case.assertEqual(user.username, case.expected_username)
+        case.assertEqual(exchange_call.kwargs["resource_owner_key"], "first-token")
+        case.assertEqual(self.pending_tokens(), [])
+
+    def test_canceled_callback_preserves_pending_tokens(self) -> None:
+        case = cast("OAuth1Test", self)
+        self.start_flow("first-token", "first-secret")
+        self.start_flow("second-token", "second-secret")
+        legacy_token = self.use_legacy_format_for_first_token()
+        pending = list(self.pending_tokens())
+
+        case.strategy.set_request_data({"oauth_problem": "user_refused"}, case.backend)
+        with case.assertRaises(AuthCanceled):
+            case.backend.complete()
+        case.assertEqual(self.pending_tokens(), pending)
+
+        case.strategy.remove_from_request_data("oauth_problem")
+        user, _ = self.complete_flow("second-token", "verifier-two")
+        case.assertEqual(user.username, case.expected_username)
+        case.assertEqual(self.pending_tokens(), [legacy_token])
