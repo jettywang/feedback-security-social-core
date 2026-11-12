@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- Cover partial-pipeline resume boundaries with regression tests using the fake
+  strategy and storage: a token from another browser, a different backend, a
+  callback with a different provider UID, or an already consumed token cannot
+  restore the original flow's identity, and failed attempts leave the in-progress
+  flow untouched. Interleaved logins resume independently with a single
+  association each, and transient partial storage outages during pause or resume
+  propagate without creating duplicate associations or losing resumable state.
+
 ## [7.1.0](https://github.com/python-social-auth/social-core/releases/tag/7.1.0) - 2026-11-11
 
 ### Security
