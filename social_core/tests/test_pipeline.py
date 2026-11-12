@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import unittest
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import Mock, patch
 
 from social_core.backends.base import BaseAuth
 from social_core.exceptions import AuthException
 from social_core.pipeline.user import create_user, user_details
+from social_core.strategy import BaseStrategy
 from social_core.utils import PARTIAL_TOKEN_SESSION_NAME
 
 from .actions.actions import BaseActionTest
@@ -93,6 +94,142 @@ class PipelineResultTest(unittest.TestCase):
                 self.assertTrue(result["done"])
                 self.assertEqual(second.call_args.kwargs["value"], "updated")
                 third.assert_called_once()
+
+
+class RecordingStrategy(TestStrategy):
+    """Strategy double recording the context later pipeline steps receive."""
+
+    authenticate = BaseStrategy.authenticate
+
+    def __init__(self, storage, tpl=None) -> None:
+        self.pipeline_calls: list[dict[str, Any]] = []
+        super().__init__(storage, tpl)
+
+
+class PipelineFrameworkContextTest(unittest.TestCase):
+    def setUp(self) -> None:
+        User.reset_cache()
+        self.addCleanup(User.reset_cache)
+        self.strategy = RecordingStrategy(TestStorage)
+        self.backend: BaseAuth[object] = BaseAuth(self.strategy)
+
+    def test_step_output_cannot_replace_framework_context(self) -> None:
+        user = User("foobar")
+        result = self.backend.run_pipeline(
+            [
+                "social_core.tests.pipeline.return_third_party_fields",
+                "social_core.tests.pipeline.record_pipeline_call",
+            ],
+            user=user,
+            details={"username": "foobar"},
+        )
+        assert isinstance(result, dict)
+        self.assertEqual(len(self.strategy.pipeline_calls), 1)
+        call = self.strategy.pipeline_calls[0]
+        # The following step received the real framework objects.
+        self.assertIs(call["backend"], self.backend)
+        self.assertIs(call["strategy"], self.strategy)
+        kwargs = call["kwargs"]
+        self.assertNotIn("request", kwargs)
+        self.assertEqual(kwargs["pipeline_index"], 1)
+        # Extension data updates still reach the following step.
+        self.assertIs(kwargs["user"], user)
+        self.assertEqual(
+            kwargs["details"], {"username": "foobar", "third_party": "value"}
+        )
+        self.assertEqual(kwargs["third_party_field"], "third-party-value")
+        # The final context keeps the framework objects.
+        self.assertIs(result["backend"], self.backend)
+        self.assertIs(result["strategy"], self.strategy)
+        self.assertNotIn("request", result)
+
+    def test_response_still_stops_pipeline_after_framework_named_output(
+        self,
+    ) -> None:
+        response = Redirect("/pause")
+        first = Mock(
+            return_value={
+                "backend": "third-party-backend",
+                "strategy": "third-party-strategy",
+                "request": "third-party-request",
+            }
+        )
+        second = Mock(return_value=response)
+        with patch(
+            "social_core.backends.base.module_member", side_effect=[first, second]
+        ):
+            result = self.backend.run_pipeline(["first", "second"])
+        self.assertIs(result, response)
+        second.assert_called_once()
+        self.assertIs(second.call_args.kwargs["backend"], self.backend)
+        self.assertIs(second.call_args.kwargs["strategy"], self.strategy)
+        self.assertNotIn("request", second.call_args.kwargs)
+
+    def test_exceptions_propagate_after_framework_named_output(self) -> None:
+        first = Mock(
+            return_value={"backend": "third-party-backend", "strategy": "fake"}
+        )
+        second = Mock(side_effect=UnknownError)
+        with (
+            patch(
+                "social_core.backends.base.module_member", side_effect=[first, second]
+            ),
+            self.assertRaises(UnknownError),
+        ):
+            self.backend.run_pipeline(["first", "second"])
+
+    def test_partial_resume_keeps_framework_context(self) -> None:
+        user = User("foobar")
+        self.strategy.set_settings(
+            {
+                "SOCIAL_AUTH_PIPELINE": (
+                    "social_core.tests.pipeline.return_third_party_fields",
+                    "social_core.tests.pipeline.pause_until_attribute",
+                    "social_core.tests.pipeline.record_pipeline_call",
+                )
+            }
+        )
+        response = self.strategy.authenticate(self.backend, response={}, user=user)
+        self.assertIsInstance(response, Redirect)
+
+        token = self.strategy.session_pop(PARTIAL_TOKEN_SESSION_NAME)
+        partial = cast("PartialMixin", self.strategy.partial_load(token))
+        self.assertIsNotNone(partial)
+        self.strategy.session_set("attribute", "testing")
+        resumed_user = self.backend.continue_pipeline(partial)
+        self.assertIs(resumed_user, user)
+
+        self.assertEqual(len(self.strategy.pipeline_calls), 1)
+        call = self.strategy.pipeline_calls[0]
+        self.assertIs(call["backend"], self.backend)
+        self.assertIs(call["strategy"], self.strategy)
+        kwargs = call["kwargs"]
+        self.assertNotIn("request", kwargs)
+        self.assertEqual(kwargs["pipeline_index"], 2)
+        self.assertIs(kwargs["user"], user)
+        self.assertEqual(kwargs["details"], {"third_party": "value"})
+        self.assertEqual(kwargs["third_party_field"], "third-party-value")
+        self.assertTrue(kwargs["resumed"])
+
+    def test_disconnect_pipeline_keeps_framework_context(self) -> None:
+        self.strategy.set_settings(
+            {
+                "SOCIAL_AUTH_DISCONNECT_PIPELINE": (
+                    "social_core.tests.pipeline.return_third_party_fields",
+                    "social_core.tests.pipeline.record_pipeline_call",
+                )
+            }
+        )
+        user = User("foobar")
+        result = self.backend.disconnect(user=user)
+        assert isinstance(result, dict)
+        self.assertEqual(len(self.strategy.pipeline_calls), 1)
+        call = self.strategy.pipeline_calls[0]
+        self.assertIs(call["backend"], self.backend)
+        self.assertIs(call["strategy"], self.strategy)
+        self.assertIs(call["kwargs"]["user"], user)
+        self.assertIs(result["backend"], self.backend)
+        self.assertIs(result["strategy"], self.strategy)
 
 
 class IntegrityError(Exception):

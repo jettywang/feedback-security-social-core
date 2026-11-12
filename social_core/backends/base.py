@@ -23,6 +23,7 @@ from social_core.exceptions import (
     SocialAuthBaseException,
 )
 from social_core.identifiers import UNVERIFIED_LEGACY_TRANSITIONS
+from social_core.pipeline import PIPELINE_FRAMEWORK_KEYS
 from social_core.registry import REGISTRY
 from social_core.response_types import HttpResponseProtocol as _HttpResponseProtocol
 from social_core.utils import (
@@ -386,6 +387,13 @@ class BaseAuth(Generic[ResponseT_co]):
 
         Falsy step results continue execution. Truthy non-dictionary results,
         such as HTTP responses, stop execution and are returned unchanged.
+
+        Step dictionaries are extension data: they may add or update pipeline
+        values such as ``user`` and ``details`` for the following steps. The
+        names in ``PIPELINE_FRAMEWORK_KEYS`` (``strategy``, ``backend``,
+        ``request``, and ``pipeline_index``) belong to the framework context
+        the runner manages; step output cannot replace them, so custom steps
+        must use other names for their own data.
         """
         out = kwargs.copy()
         out.setdefault("strategy", self.strategy)
@@ -406,6 +414,8 @@ class BaseAuth(Generic[ResponseT_co]):
             result = func(*args, **out) or {}
             if not isinstance(result, dict):
                 return result
+            for key in PIPELINE_FRAMEWORK_KEYS:
+                result.pop(key, None)
             out.update(result)
         return out
 

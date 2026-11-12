@@ -1,3 +1,26 @@
+"""Authentication and disconnect pipelines.
+
+A pipeline step returns either a dictionary of pipeline data, a framework
+response object to halt the pipeline, or a falsy value to continue without
+changes. Dictionaries are merged into the pipeline data passed to the
+following steps, so steps may add or update extension data such as ``user``
+and ``details`` or any custom names of their own.
+
+The names in ``PIPELINE_FRAMEWORK_KEYS`` belong to the framework context that
+the pipeline runner manages. Step output cannot replace them: entries under
+those names are discarded instead of being merged. Custom steps, including
+steps returning fields fetched from third-party services, must use other
+names for their own data.
+"""
+
+# Names owned by the pipeline runner's framework context. ``strategy`` and
+# ``backend`` are the objects the pipeline is running with, ``request`` is
+# deliberately not exposed to pipeline data, and ``pipeline_index`` tracks
+# the executing step.
+PIPELINE_FRAMEWORK_KEYS: frozenset[str] = frozenset(
+    {"strategy", "backend", "request", "pipeline_index"}
+)
+
 DEFAULT_AUTH_PIPELINE = (
     # Get the information we can about the user and return it in a simple
     # format to create the user instance later. On some cases the details are

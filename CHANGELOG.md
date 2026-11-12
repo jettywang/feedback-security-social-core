@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- Pipeline step dictionaries can no longer replace the framework context
+  (`strategy`, `backend`, `request`, and `pipeline_index`; see
+  `social_core.pipeline.PIPELINE_FRAMEWORK_KEYS`) passed to following steps.
+  Steps returning fields fetched from third-party services must use other
+  names for their own data; `user`, `details`, and other extension data still
+  merge into the pipeline as before.
+
 ## [7.1.0](https://github.com/python-social-auth/social-core/releases/tag/7.1.0) - 2026-11-11
 
 ### Security

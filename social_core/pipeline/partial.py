@@ -57,6 +57,12 @@ def partial_step(
     that's not None or {} will be considered a response object and
     will be returned to user.
 
+    Dictionary outputs are merged into the pipeline data as extension
+    data; the framework context names in
+    ``social_core.pipeline.PIPELINE_FRAMEWORK_KEYS`` (``strategy``,
+    ``backend``, ``request``, and ``pipeline_index``) cannot be replaced
+    by step output.
+
     The pipeline function will receive a current_partial object, it
     contains the partial pipeline data and a token that is used to
     identify it when it's continued, this is useful to build links
