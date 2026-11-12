@@ -3,10 +3,12 @@ from __future__ import annotations
 import copy
 import datetime as dt
 import json
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 from unittest.mock import patch
+from urllib.parse import urlparse
 
 import jwt
+import requests
 import responses
 
 from social_core.backends.open_id_connect import OpenIdConnectAuth
@@ -16,6 +18,7 @@ from social_core.exceptions import (
     AuthResponseError,
 )
 from social_core.tests.exception_helpers import assert_auth_error
+from social_core.tests.models import TestUserSocialAuth, User
 from social_core.utils import get_querystring, parse_qs
 
 from .oauth import BaseAuthUrlTestMixin
@@ -996,3 +999,212 @@ class ExampleOpenIdConnectInvalidParamsTest(OpenIdConnectTest):
                 }
             )
             self.backend.auth_params(state=self.backend.get_or_create_state())
+
+
+class OpenIdConnectWithoutUserinfo(ExampleOpenIdConnectAuth):
+    """Provider without a UserInfo endpoint; claims come from the ID token."""
+
+    name = "example-id-token-only"
+
+    def user_data(self, access_token: str, *args, **kwargs) -> dict[str, Any]:
+        return {}
+
+
+class OpenIdConnectUserinfoSubBindingTest(OpenIdConnectTest):
+    """End-to-end regression for UserInfo subject binding.
+
+    The validated ID token subject is the only trusted account identifier.
+    A UserInfo response naming a different subject must be rejected before
+    any local account is created, associated, or migrated to another person.
+    """
+
+    backend_path = (
+        "social_core.tests.backends.test_open_id_connect.ExampleOpenIdConnectAuth"
+    )
+    issuer = "https://example.com"
+    openid_config_body = json.dumps(
+        {
+            "issuer": "https://example.com",
+            "authorization_endpoint": "https://example.com/oidc/auth",
+            "token_endpoint": "https://example.com/oidc/token",
+            "userinfo_endpoint": "https://example.com/oidc/userinfo",
+            "revocation_endpoint": "https://example.com/oidc/revoke",
+            "jwks_uri": "https://example.com/oidc/certs",
+        }
+    )
+
+    expected_username = "cartman"
+    id_token_subject = "id-token-subject"
+    userinfo_subject = "userinfo-subject"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.access_token_kwargs = {"subject": self.id_token_subject}
+        self.userinfo_response: dict[str, str] = {
+            "preferred_username": self.expected_username
+        }
+
+    def pre_complete_callback(self, start_url) -> None:
+        super().pre_complete_callback(start_url)
+        responses.add(
+            responses.GET,
+            url=self.backend.userinfo_url(),
+            status=200,
+            body=json.dumps(self.userinfo_response),
+            content_type="application/json",
+        )
+
+    def persisted_social(self, uid: str):
+        return TestUserSocialAuth.get_social_auth(self.backend.name, uid)
+
+    def complete_with_user(self, user):
+        start_url = self.backend.start().url
+        target_url = self.auth_handlers(start_url)
+        response = requests.get(start_url, timeout=1)
+        self.assertEqual(response.url, target_url)
+        self.strategy.set_request_data(
+            parse_qs(urlparse(start_url).query), self.backend
+        )
+        self.strategy.set_request_data(
+            parse_qs(urlparse(target_url).query), self.backend
+        )
+        self.pre_complete_callback(start_url)
+        return self.backend.complete(user=user)
+
+    def test_login_persists_validated_subject(self) -> None:
+        self.userinfo_response["sub"] = self.id_token_subject
+
+        user = self.do_login()
+
+        social = user.social[0]
+        self.assertEqual(social.uid, self.id_token_subject)
+        self.assertIs(self.persisted_social(self.id_token_subject), social)
+        self.assertIs(social.user, user)
+
+    def test_userinfo_sub_mismatch_rejected_without_binding(self) -> None:
+        victim = User(username="victim")
+        victim_social = TestUserSocialAuth(
+            victim, self.backend.name, self.userinfo_subject
+        )
+        self.userinfo_response["sub"] = self.userinfo_subject
+
+        with assert_auth_error(self, AuthResponseError, "invalid_claim") as error:
+            self.do_login()
+
+        self.assertEqual(error.exception.stage, "user_info")
+        self.assertIsNone(self.persisted_social(self.id_token_subject))
+        self.assertIs(self.persisted_social(self.userinfo_subject), victim_social)
+        self.assertIs(victim_social.user, victim)
+        self.assertEqual(victim.social, [victim_social])
+        self.assertEqual(list(User.cache.values()), [victim])
+        self.assertIsNone(self.strategy.session_get("username"))
+
+    def test_userinfo_without_sub_binds_id_token_subject(self) -> None:
+        user = self.do_login()
+
+        social = user.social[0]
+        self.assertEqual(social.uid, self.id_token_subject)
+        self.assertIs(self.persisted_social(self.id_token_subject), social)
+
+    def test_matching_sub_with_diverging_profile_binds_validated_subject(
+        self,
+    ) -> None:
+        get_id_token = self.get_id_token
+
+        def token_with_profile(*args, **kwargs):
+            return {
+                **get_id_token(*args, **kwargs),
+                "email": "token@example.com",
+                "preferred_username": "token-user",
+            }
+
+        self.userinfo_response.update(
+            {"sub": self.id_token_subject, "email": "userinfo@example.com"}
+        )
+        with patch.object(self, "get_id_token", side_effect=token_with_profile):
+            user = self.do_login()
+
+        social = user.social[0]
+        self.assertEqual(social.uid, self.id_token_subject)
+        self.assertIs(self.persisted_social(self.id_token_subject), social)
+        self.assertEqual(user.email, "userinfo@example.com")
+        self.assertEqual(user.username, self.expected_username)
+
+    def test_association_binds_validated_subject_to_current_user(self) -> None:
+        self.userinfo_response["sub"] = self.id_token_subject
+        local_user = User(username="local-user")
+
+        user = self.complete_with_user(local_user)
+
+        self.assertIs(user, local_user)
+        social = local_user.social[0]
+        self.assertEqual(social.uid, self.id_token_subject)
+        self.assertIs(self.persisted_social(self.id_token_subject), social)
+        self.assertIs(social.user, local_user)
+
+    def test_association_rejects_userinfo_sub_mismatch(self) -> None:
+        local_user = User(username="local-user")
+        victim = User(username="victim")
+        victim_social = TestUserSocialAuth(
+            victim, self.backend.name, self.userinfo_subject
+        )
+        self.userinfo_response["sub"] = self.userinfo_subject
+
+        with assert_auth_error(self, AuthResponseError, "invalid_claim") as error:
+            self.complete_with_user(local_user)
+
+        self.assertEqual(error.exception.stage, "user_info")
+        self.assertEqual(local_user.social, [])
+        self.assertIsNone(self.persisted_social(self.id_token_subject))
+        self.assertIs(self.persisted_social(self.userinfo_subject), victim_social)
+        self.assertIs(victim_social.user, victim)
+
+
+class OpenIdConnectUserinfoDisabledTest(OpenIdConnectTest):
+    """Providers without UserInfo bind the validated ID token subject only."""
+
+    backend_path = (
+        "social_core.tests.backends.test_open_id_connect.OpenIdConnectWithoutUserinfo"
+    )
+    issuer = "https://example.com"
+    openid_config_body = json.dumps(
+        {
+            "issuer": "https://example.com",
+            "authorization_endpoint": "https://example.com/oidc/auth",
+            "token_endpoint": "https://example.com/oidc/token",
+            "revocation_endpoint": "https://example.com/oidc/revoke",
+            "jwks_uri": "https://example.com/oidc/certs",
+        }
+    )
+
+    expected_username = "cartman"
+    id_token_subject = "id-token-subject"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.access_token_kwargs = {"subject": self.id_token_subject}
+
+    def test_login_binds_id_token_subject_without_userinfo(self) -> None:
+        get_id_token = self.get_id_token
+
+        def token_with_profile(*args, **kwargs):
+            return {
+                **get_id_token(*args, **kwargs),
+                "email": "token@example.com",
+                "preferred_username": self.expected_username,
+            }
+
+        with patch.object(self, "get_id_token", side_effect=token_with_profile):
+            user = self.do_login()
+
+        social = user.social[0]
+        self.assertEqual(social.uid, self.id_token_subject)
+        self.assertIs(
+            TestUserSocialAuth.get_social_auth(
+                self.backend.name, self.id_token_subject
+            ),
+            social,
+        )
+        self.assertFalse(
+            any("userinfo" in str(call.request.url) for call in responses.calls)
+        )
